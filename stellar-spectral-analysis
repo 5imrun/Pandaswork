@@ -1,0 +1,303 @@
+# ==== DOWNLOAD ***STAR*** DATA FROM ESO ARCHIVE AND PLOT ====
+from astroquery.eso import Eso
+from astropy.io import fits
+from astropy.modeling import models, fitting
+from astropy import constants as const
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from specutils import Spectrum, SpectralRegion
+from specutils.manipulation import extract_region
+import astropy.units as u
+
+eso = Eso()
+query = 'Au Mic'
+instrument = 'HARPS'
+
+results = eso.query_surveys(target=query, surveys=instrument)
+print(results.colnames)
+print(results[:10])
+
+if "Product category" in results.colnames:
+    spec_rows = [("SPECTRUM" in str(x)) for x in results["Product category"]]
+    spec = results[spec_rows]
+else:
+    spec = results
+print("Total rows:", len(results))
+print("Spectrum-like rows:", len(spec))
+print(spec[:10])
+
+use = spec if len(spec) > 0 else results
+arc = use["ARCFILE"][0]
+print("Downloading ARCFILE:", arc)
+downloaded = eso.retrieve_data(arc)
+print("Downloaded:", downloaded)
+
+path = downloaded[0] if isinstance(downloaded, (list, tuple)) else downloaded
+hdul = fits.open(path)
+hdul.info()
+
+star = query
+star_data = fits.open(path)
+data = star_data[1].data
+print(data.columns)
+
+xvals = data['WAVE'][0]
+yvals = data['FLUX'][0]
+
+xmin = xvals[0]
+xmax = xvals[-1]
+print("Wavelength range:", xmin, "to", xmax)
+
+plt.plot(xvals, yvals, color='tab:pink')
+plt.xlabel('Wavelength (Å)')
+plt.ylabel('Flux')
+plt.title(f'Full Spectrum: {star}, Instrument: {instrument}\nWavelengths from {xmin:.2f} to {xmax:.2f} Å')
+plt.autoscale(enable=True, axis='both', tight=True)
+filename = f"Spectrum_{star}_{instrument}_{xmin:.2f}-{xmax:.2f}.png"
+plt.savefig(filename)
+plt.show()
+
+# ==== LOCAL CONTINUUM NORMALIZATION ====
+spectrum = Spectrum(
+    spectral_axis=xvals * u.AA,
+    flux=yvals * u.Unit('erg / (cm^2 s AA)')
+)
+
+def local_normalize(spectrum, line_center, window=20, shoulder=5):
+    lo = line_center - window
+    hi = line_center + window
+    region = SpectralRegion(lo * u.AA, hi * u.AA)
+    try:
+        sub = extract_region(spectrum, region)
+    except Exception:
+        print(f"Warning: {lo}-{hi} Å not covered, skipping.")
+        return None, None
+    wave = sub.spectral_axis.value
+    flux = sub.flux.value
+    shoulder_mask = (wave < line_center - shoulder) | (wave > line_center + shoulder)
+    try:
+        p_init = models.Chebyshev1D(1)
+        fitter = fitting.LinearLSQFitter()
+        p = fitter(p_init, wave[shoulder_mask], flux[shoulder_mask])
+        continuum = p(wave)
+        flux_norm = flux / continuum
+    except Exception as e:
+        print(f"Warning: continuum fit failed around {line_center} Å: {e}")
+        return None, None
+    return wave, flux_norm
+
+def centroid(wave, flux_norm, line_center, half_width=3):
+    mask = (wave > line_center - half_width) & (wave < line_center + half_width)
+    w = wave[mask]
+    f = flux_norm[mask]
+    deficit = 1.0 - f
+    deficit = np.clip(deficit, 0, None)
+    if deficit.sum() == 0:
+        return None
+    return np.sum(w * deficit) / np.sum(deficit)
+
+
+# ==== PER-STAR RV CORRECTION ====
+# Simple Doppler formula: λ_obs = λ_rest × (1 + v/c)
+# Rearranged: v/c = (λ_obs - λ_rest) / λ_rest
+# Apply same ratio to every other line: λ_corrected = λ_rest × (1 + v/c)
+#
+# For young/active stars H-alpha can be in emission, which breaks the
+# absorption centroid. Fall back to Na D1, always in absorption.
+
+HA_REST = 6562.801  # H-alpha rest wavelength in air (Å)
+NA_REST = 5889.95   # Na D1 rest wavelength in air (Å)
+
+# normalize around H-alpha at rest to check absorption vs emission
+wave_ha_init, flux_ha_init = local_normalize(spectrum, line_center=HA_REST, window=40, shoulder=8)
+
+if wave_ha_init is None:
+    raise RuntimeError("H-alpha not covered — cannot compute RV correction.")
+
+# if peak above 1.0 is bigger than dip below 1.0, line is in emission
+ha_is_emission = (flux_ha_init.max() - 1.0) > (1.0 - flux_ha_init.min())
+
+if ha_is_emission:
+    print("H-alpha is in EMISSION (active/young star) — using Na D1 for RV correction.")
+    wave_rv, flux_rv = local_normalize(spectrum, line_center=NA_REST, window=20, shoulder=6)
+    rv_rest = NA_REST
+    if wave_rv is None:
+        raise RuntimeError("Na D1 also not covered — cannot compute RV correction.")
+else:
+    wave_rv, flux_rv = wave_ha_init, flux_ha_init
+    rv_rest = HA_REST
+
+c_rv = centroid(wave_rv, flux_rv, rv_rest)
+if c_rv is None:
+    raise RuntimeError("RV centroid failed — line too noisy.")
+
+# v/c ratio — apply directly to all rest wavelengths
+v_over_c      = (c_rv - rv_rest) / rv_rest
+velocity_km_s = v_over_c * const.c.to('km/s').value
+
+print(f"\n--- RV Correction ---")
+print(f"Reference line:    {'Na D1' if ha_is_emission else 'H-alpha'}")
+print(f"Rest wavelength:   {rv_rest:.4f} Å")
+print(f"Observed centroid: {c_rv:.4f} Å")
+print(f"Radial velocity:   {velocity_km_s:.2f} km/s")
+
+# λ_obs = λ_rest × (1 + v/c) for every line
+ha_ref   = 6562.801 * (1 + v_over_c)
+li_ref   = 6707.76  * (1 + v_over_c)
+fe_ref   = 6707.4   * (1 + v_over_c)
+cahk_h   = 3968.0   * (1 + v_over_c)
+cahk_k   = 3933.0   * (1 + v_over_c)
+na_ref   = 5889.95  * (1 + v_over_c)
+mg_ref   = 5183.62  * (1 + v_over_c)
+
+
+# normalize around each feature using corrected centers
+wave_ha,   flux_ha   = local_normalize(spectrum, line_center=ha_ref,  window=40, shoulder=8)
+wave_li,   flux_li   = local_normalize(spectrum, line_center=li_ref,  window=15, shoulder=4)
+wave_cahk, flux_cahk = local_normalize(spectrum, line_center=3950.0 * (1 + v_over_c), window=30, shoulder=8)
+wave_na,   flux_na   = local_normalize(spectrum, line_center=na_ref,  window=20, shoulder=6)
+wave_mg,   flux_mg   = local_normalize(spectrum, line_center=mg_ref,  window=20, shoulder=6)
+
+# centroid check printout
+print("\n--- Centroid Check (offsets should now be near 0) ---")
+if wave_ha is not None:
+    c_ha2 = centroid(wave_ha, flux_ha, ha_ref)
+    if c_ha2: print(f"H-alpha:  ref={ha_ref:.3f} Å,  centroid={c_ha2:.3f} Å,  offset={c_ha2 - ha_ref:.3f} Å")
+if wave_li is not None:
+    c_li = centroid(wave_li, flux_li, li_ref)
+    if c_li: print(f"Lithium:  ref={li_ref:.3f} Å,  centroid={c_li:.3f} Å,  offset={c_li - li_ref:.3f} Å")
+if wave_na is not None:
+    c_na = centroid(wave_na, flux_na, na_ref)
+    if c_na: print(f"Na D1:    ref={na_ref:.3f} Å,  centroid={c_na:.3f} Å,  offset={c_na - na_ref:.3f} Å")
+if wave_mg is not None:
+    c_mg = centroid(wave_mg, flux_mg, mg_ref)
+    if c_mg: print(f"Mg b:     ref={mg_ref:.3f} Å,  centroid={c_mg:.3f} Å,  offset={c_mg - mg_ref:.3f} Å")
+
+# ==== 4-PANEL PLOT ====
+figures, graphs = plt.subplots(2, 2, figsize=(10, 8))
+plt.suptitle(f'\nLocally Normalized Key Spectral Features for {star}\n(RV = {velocity_km_s:.1f} km/s via {"Na D1" if ha_is_emission else "H-alpha"})', fontsize=14)
+plt.subplots_adjust(hspace=0.35)
+
+if wave_ha is not None:
+    graphs[0,0].plot(wave_ha, flux_ha, 'tab:pink')
+    graphs[0,0].axvline(x=ha_ref, color='black', ls='--', label=f'ref {ha_ref:.2f}')
+    c = centroid(wave_ha, flux_ha, ha_ref)
+    if c: graphs[0,0].axvline(x=c, color='blue', ls=':', label=f'centroid {c:.2f}')
+    graphs[0,0].axhline(y=1.0, color='gray', ls=':', linewidth=0.8)
+    pad = 0.1 * (flux_ha.max() - flux_ha.min())
+    graphs[0,0].set_ylim(flux_ha.min() - pad, flux_ha.max() + pad)
+    graphs[0,0].legend(fontsize=7)
+else:
+    graphs[0,0].text(0.5, 0.5, 'Not covered', ha='center', va='center', transform=graphs[0,0].transAxes)
+graphs[0,0].set_title(r'H-alpha')
+graphs[0,0].set_xlabel('Wavelength (Å)')
+graphs[0,0].set_ylabel('Normalized Flux')
+
+if wave_li is not None:
+    graphs[0,1].plot(wave_li, flux_li, 'tab:purple')
+    graphs[0,1].axvline(x=li_ref, color='black', ls='--', label=f'Li {li_ref:.2f}')
+    graphs[0,1].axvline(x=fe_ref, color='red',   ls=':',  label=f'Fe {fe_ref:.2f}')
+    c = centroid(wave_li, flux_li, li_ref)
+    if c: graphs[0,1].axvline(x=c, color='blue', ls=':', label=f'centroid {c:.2f}')
+    graphs[0,1].axhline(y=1.0, color='gray', ls=':', linewidth=0.8)
+    pad = 0.1 * (flux_li.max() - flux_li.min())
+    graphs[0,1].set_ylim(flux_li.min() - pad, flux_li.max() + pad)
+    graphs[0,1].legend(fontsize=7)
+else:
+    graphs[0,1].text(0.5, 0.5, 'Not covered', ha='center', va='center', transform=graphs[0,1].transAxes)
+graphs[0,1].set_title(r'Lithium')
+graphs[0,1].set_xlabel('Wavelength (Å)')
+graphs[0,1].set_ylabel('Normalized Flux')
+
+if wave_cahk is not None:
+    graphs[1,0].plot(wave_cahk, flux_cahk, '#71C7A0')
+    graphs[1,0].axvline(x=cahk_k, color='black', ls='--', label=f'Ca K {cahk_k:.2f}')
+    graphs[1,0].axhline(y=1.0, color='gray', ls=':', linewidth=0.8)
+    graphs[1,0].set_xlim(cahk_k - 13, cahk_k + 7)
+    pad = 0.1 * (flux_cahk.max() - flux_cahk.min())
+    graphs[1,0].set_ylim(flux_cahk.min() - pad, flux_cahk.max() + pad)
+    graphs[1,0].legend(fontsize=7)
+else:
+    graphs[1,0].text(0.5, 0.5, 'Not covered', ha='center', va='center', transform=graphs[1,0].transAxes)
+graphs[1,0].set_title(r'Ca II K 3933 $\AA$')
+graphs[1,0].set_xlabel('Wavelength (Å)')
+graphs[1,0].set_ylabel('Normalized Flux')
+
+if wave_cahk is not None:
+    graphs[1,1].plot(wave_cahk, flux_cahk, '#4B9CD3')
+    graphs[1,1].axvline(x=cahk_h, color='black', ls='--', label=f'Ca H {cahk_h:.2f}')
+    graphs[1,1].axhline(y=1.0, color='gray', ls=':', linewidth=0.8)
+    graphs[1,1].set_xlim(cahk_h - 7, cahk_h + 13)
+    pad = 0.1 * (flux_cahk.max() - flux_cahk.min())
+    graphs[1,1].set_ylim(flux_cahk.min() - pad, flux_cahk.max() + pad)
+    graphs[1,1].legend(fontsize=7)
+else:
+    graphs[1,1].text(0.5, 0.5, 'Not covered', ha='center', va='center', transform=graphs[1,1].transAxes)
+graphs[1,1].set_title(r'Ca II H 3968 $\AA$')
+graphs[1,1].set_xlabel('Wavelength (Å)')
+graphs[1,1].set_ylabel('Normalized Flux')
+
+filename2 = f"Features_{star}_{instrument}_localnorm_RVcorr.png"
+plt.savefig(filename2)
+plt.show()
+
+# ==== DIAGNOSTIC: Na and Mg ====
+fig2, ax = plt.subplots(1, 2, figsize=(10, 4))
+plt.suptitle(f'Diagnostic Lines for {star} — RV = {velocity_km_s:.1f} km/s', fontsize=13)
+
+if wave_na is not None:
+    ax[0].plot(wave_na, flux_na, 'tab:orange')
+    ax[0].axvline(x=na_ref, color='black', ls='--', label=f'ref {na_ref:.2f}')
+    c = centroid(wave_na, flux_na, na_ref)
+    if c: ax[0].axvline(x=c, color='blue', ls=':', label=f'centroid {c:.2f}')
+    ax[0].axhline(y=1.0, color='gray', ls=':', linewidth=0.8)
+    ax[0].legend(fontsize=7)
+else:
+    ax[0].text(0.5, 0.5, 'Not covered', ha='center', va='center', transform=ax[0].transAxes)
+ax[0].set_title('Na D1')
+ax[0].set_xlabel('Wavelength (Å)')
+ax[0].set_ylabel('Normalized Flux')
+
+if wave_mg is not None:
+    ax[1].plot(wave_mg, flux_mg, 'tab:green')
+    ax[1].axvline(x=mg_ref, color='black', ls='--', label=f'ref {mg_ref:.2f}')
+    c = centroid(wave_mg, flux_mg, mg_ref)
+    if c: ax[1].axvline(x=c, color='blue', ls=':', label=f'centroid {c:.2f}')
+    ax[1].axhline(y=1.0, color='gray', ls=':', linewidth=0.8)
+    ax[1].legend(fontsize=7)
+else:
+    ax[1].text(0.5, 0.5, 'Not covered', ha='center', va='center', transform=ax[1].transAxes)
+ax[1].set_title('Mg b')
+ax[1].set_xlabel('Wavelength (Å)')
+ax[1].set_ylabel('Normalized Flux')
+
+plt.tight_layout()
+plt.savefig(f"Diagnostic_{star}_{instrument}_NaMg_RVcorr.png")
+plt.show()
+
+# ==== EQUIVALENT WIDTH: LITHIUM ====
+# EW = area between continuum (1.0) and the normalized line
+# positive value = absorption, larger = stronger line = likely younger star
+# specutils convention: EW is positive for absorption when continuum = 1.0
+
+from specutils.analysis import equivalent_width
+
+if wave_li is not None:
+    # rebuild as Spectrum object — needs to be in specutils format
+    li_spec = Spectrum(
+        spectral_axis=wave_li * u.AA,
+        flux=flux_li * u.dimensionless_unscaled
+    )
+    
+    # integration window — ±3 Å around the Li line center
+    # adjust width if the line looks broader/narrower 
+    li_region = SpectralRegion((li_ref - 3) * u.AA, (li_ref + 3) * u.AA)
+    
+    ew_li = equivalent_width(li_spec, regions=li_region)
+    print(f"\n--- Lithium EW ---")
+    print(f"Li ref wavelength: {li_ref:.4f} Å")
+    print(f"Li EW:             {ew_li:.4f}")
+    print(f"Li EW (mÅ):        {ew_li.to(u.AA).value * 1000:.2f} mÅ")
+else:
+    print("Lithium region not covered — no EW calculated.")
